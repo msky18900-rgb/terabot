@@ -1,8 +1,6 @@
 FROM python:3.11-slim
-
 WORKDIR /app
 
-# Install ALL system dependencies Playwright needs in one layer
 RUN apt-get update && apt-get install -y \
     wget curl gnupg ca-certificates \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
@@ -12,13 +10,11 @@ RUN apt-get update && apt-get install -y \
     libx11-6 libxext6 fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install Playwright chromium AFTER system deps are ready
-RUN playwright install chromium
+RUN playwright install chromium --with-deps
 
 COPY . .
-
 CMD ["python", "main.py"]
