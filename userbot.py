@@ -5,6 +5,7 @@ import asyncio
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeFilename
+from telethon.network import ConnectionTcpFull
 from queue_manager import upload_queue, UploadJob
 from config import (
     TELEGRAM_API_ID, TELEGRAM_API_HASH,
@@ -19,14 +20,33 @@ client = TelegramClient(
     StringSession(TELEGRAM_SESSION),
     TELEGRAM_API_ID,
     TELEGRAM_API_HASH,
-    connection_retries=15,
-    retry_delay=5,
+    connection=ConnectionTcpFull,
+    connection_retries=-1,      # retry forever
+    retry_delay=3,
     auto_reconnect=True,
+    request_retries=10,
 )
 
 
+async def ensure_connected():
+    """Make sure client is connected before any operation."""
+    if not client.is_connected():
+        logger.warning("Client not connected — reconnecting...")
+        await client.connect()
+        await asyncio.sleep(2)
+    # Ping Telegram to verify connection is alive
+    try:
+        await client.get_me()
+    except Exception:
+        logger.warning("Ping failed — forcing reconnect...")
+        await client.disconnect()
+        await asyncio.sleep(3)
+        await client.connect()
+        await asyncio.sleep(2)
+
+
 async def send_status(chat_id: int, text: str) -> int:
-    async with httpx.AsyncClient() as http:
+    async with httpx.AsyncClient(timeout=30) as http:
         r = await http.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
@@ -36,7 +56,7 @@ async def send_status(chat_id: int, text: str) -> int:
 
 async def edit_status(chat_id: int, message_id: int, text: str):
     try:
-        async with httpx.AsyncClient() as http:
+        async with httpx.AsyncClient(timeout=30) as http:
             await http.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText",
                 json={
@@ -50,12 +70,47 @@ async def edit_status(chat_id: int, message_id: int, text: str):
         logger.warning(f"edit_status failed: {e}")
 
 
+async def download_with_retry(msg, local_path: str, progress_cb, max_attempts=3):
+    """Attempt download up to max_attempts times with reconnect between tries."""
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await ensure_connected()
+            logger.info(f"Download attempt {attempt}...")
+            result = await asyncio.wait_for(
+                client.download_media(
+                    msg,
+                    file=local_path,
+                    progress_callback=progress_cb
+                ),
+                timeout=7200  # 2 hours
+            )
+            return result
+        except (ConnectionError, asyncio.TimeoutError) as e:
+            last_error = e
+            logger.error(f"Download attempt {attempt} failed: {e}")
+            # Remove partial file
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            if attempt < max_attempts:
+                wait = 10 * attempt
+                logger.info(f"Retrying in {wait}s...")
+                await asyncio.sleep(wait)
+                await client.disconnect()
+                await asyncio.sleep(3)
+                await client.connect()
+                await asyncio.sleep(3)
+        except Exception as e:
+            raise e  # Non-connection errors bubble up immediately
+
+    raise ConnectionError(f"Download failed after {max_attempts} attempts: {last_error}")
+
+
 @client.on(events.NewMessage(incoming=True))
 async def handle_incoming(event):
     msg = event.message
-
-    # Use sender_id directly — no network call needed
     sender_id = event.sender_id
+
     if ALLOWED_USER_ID and sender_id != ALLOWED_USER_ID:
         return
 
@@ -69,7 +124,7 @@ async def handle_incoming(event):
     if not is_video:
         return
 
-    # Get filename from attributes
+    # Get filename
     filename = None
     if msg.document:
         for attr in msg.document.attributes:
@@ -82,7 +137,6 @@ async def handle_incoming(event):
     if "." not in filename:
         filename += ".mp4"
 
-    # Sanitize filename
     safe_filename = "".join(
         c for c in filename if c.isalnum() or c in "._- "
     ).strip()
@@ -117,14 +171,7 @@ async def handle_incoming(event):
 
         logger.info(f"Downloading: {filename} -> {local_path}")
 
-        downloaded_path = await asyncio.wait_for(
-            client.download_media(
-                msg,
-                file=local_path,
-                progress_callback=dl_progress
-            ),
-            timeout=7200  # 2 hours for 2GB files
-        )
+        downloaded_path = await download_with_retry(msg, local_path, dl_progress)
 
         logger.info(f"Downloaded to: {downloaded_path}")
 
@@ -165,12 +212,6 @@ async def handle_incoming(event):
             on_progress=on_upload_progress,
         )
         await upload_queue.add_job(job)
-
-    except asyncio.TimeoutError:
-        logger.error(f"Timeout: {filename}")
-        await edit_status(chat_id, msg_id, f"❌ Download timed out for `{filename}`")
-        if os.path.exists(local_path):
-            os.remove(local_path)
 
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
