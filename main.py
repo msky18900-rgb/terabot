@@ -1,22 +1,35 @@
 import asyncio
 import logging
 import httpx
-from bot import get_bot_app, tele_client
+from bot import get_bot_app
 from userbot import client as userbot_client
 from queue_manager import upload_queue
-from config import TELEGRAM_PHONE, BOT_TOKEN
+from config import BOT_TOKEN
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 async def clear_old_sessions():
-    async with httpx.AsyncClient() as client:
-        await client.post(
+    async with httpx.AsyncClient() as http:
+        await http.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
             json={"drop_pending_updates": True}
         )
     logger.info("Cleared old webhook and pending updates.")
+
+
+async def keepalive_userbot():
+    """Reconnect userbot if it drops."""
+    while True:
+        try:
+            if not userbot_client.is_connected():
+                logger.warning("Userbot disconnected — reconnecting...")
+                await userbot_client.connect()
+            await asyncio.sleep(30)
+        except Exception as e:
+            logger.error(f"Keepalive error: {e}")
+            await asyncio.sleep(10)
 
 
 async def run_all():
@@ -25,11 +38,15 @@ async def run_all():
 
     upload_queue.start()
 
-    # Only start userbot — it handles download + upload directly
-    await userbot_client.start()
-    logger.info("Userbot started.")
+    # Connect userbot
+    await userbot_client.connect()
+    if not await userbot_client.is_user_authorized():
+        logger.error("Userbot session expired! Re-generate TELEGRAM_SESSION on Colab.")
+        return
 
-    # Bot still runs for /start and /status commands
+    logger.info("Userbot connected and authorized.")
+
+    # Start bot
     bot_app = get_bot_app()
     await bot_app.initialize()
     await bot_app.start()
@@ -37,7 +54,11 @@ async def run_all():
 
     logger.info("All services running.")
 
-    await userbot_client.run_until_disconnected()
+    # Run both keepalive and userbot together
+    await asyncio.gather(
+        userbot_client.run_until_disconnected(),
+        keepalive_userbot(),
+    )
 
     await bot_app.updater.stop()
     await bot_app.stop()
