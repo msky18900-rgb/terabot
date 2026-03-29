@@ -5,6 +5,10 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+def format_size(mb: float) -> str:
+    if mb >= 1024:
+        return f"{mb/1024:.1f} GB"
+    return f"{mb:.1f} MB"
 
 @dataclass
 class UploadJob:
@@ -12,12 +16,11 @@ class UploadJob:
     filename: str
     size_mb: float
     local_path: str
-    status_msg: object        # Telegram message to edit
+    status_msg: object
     on_progress: Callable
     retries: int = 0
     max_retries: int = 3
-    status: str = "queued"   # queued | downloading | uploading | done | failed
-
+    status: str = "queued"
 
 class UploadQueue:
     def __init__(self):
@@ -43,7 +46,7 @@ class UploadQueue:
     async def add_job(self, job: UploadJob):
         self._jobs[job.job_id] = job
         await self._queue.put(job.job_id)
-        logger.info(f"Queued job: {job.filename} (queue size: {self._queue.qsize()})")
+        logger.info(f"📋 Queued job {job.job_id[:8]}: {job.filename} ({format_size(job.size_mb)})")
 
     async def _process_loop(self):
         while True:
@@ -51,7 +54,6 @@ class UploadQueue:
             job = self._jobs.get(job_id)
             if not job:
                 continue
-
             self._current = job_id
             await self._run_job(job)
             self._current = None
@@ -65,57 +67,41 @@ class UploadQueue:
             try:
                 job.status = "uploading"
                 if attempt > 1:
-                    try:
-                        await job.status_msg.edit_text(
-                            f"🔄 *Retry {attempt}/{job.max_retries}*\n"
-                            f"⬆️ Uploading `{job.filename}`...",
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        pass
-
-                await upload_to_terabox(job.local_path, job.on_progress)
-                job.status = "done"
-
-                try:
                     await job.status_msg.edit_text(
-                        f"✅ *Upload Complete!*\n"
-                        f"📁 `{job.filename}` ({job.size_mb} MB)\n"
-                        f"☁️ Saved in Terabox → My Resources",
+                        f"🔄 Retry {attempt}/{job.max_retries}\n⬆️ Uploading `{job.filename}`...",
                         parse_mode="Markdown"
                     )
-                except Exception:
-                    pass
 
-                break  # Success — exit retry loop
+                await upload_to_terabox(job.local_path, job.on_progress)
+
+                job.status = "done"
+                await job.status_msg.edit_text(
+                    f"✅ *Upload Complete!*\n"
+                    f"📁 `{job.filename}` ({format_size(job.size_mb)})\n"
+                    f"☁️ Saved in Terabox → 我的资源",
+                    parse_mode="Markdown"
+                )
+                break
 
             except Exception as e:
                 logger.error(f"Job {job.filename} attempt {attempt} failed: {e}")
                 job.retries = attempt
-
                 if attempt == job.max_retries:
                     job.status = "failed"
-                    try:
-                        await job.status_msg.edit_text(
-                            f"❌ *Upload Failed* after {job.max_retries} attempts\n"
-                            f"📁 `{job.filename}`\n"
-                            f"Error: `{e}`",
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        pass
+                    await job.status_msg.edit_text(
+                        f"❌ *Upload Failed* after {job.max_retries} attempts\n"
+                        f"📁 `{job.filename}`\nError: `{str(e)[:200]}`",
+                        parse_mode="Markdown"
+                    )
                 else:
-                    # Wait before retry (exponential backoff)
-                    wait = 10 * attempt
+                    wait = 15 * attempt
                     logger.info(f"Retrying in {wait}s...")
                     await asyncio.sleep(wait)
-
             finally:
-                # Clean up local file after last attempt
-                if job.status in ("done", "failed"):
-                    if os.path.exists(job.local_path):
+                if job.status in ("done", "failed") and os.path.exists(job.local_path):
+                    try:
                         os.remove(job.local_path)
+                    except Exception:
+                        pass
 
-
-# Global queue instance
 upload_queue = UploadQueue()
