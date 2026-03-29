@@ -19,32 +19,21 @@ async def clear_old_sessions():
     logger.info("Cleared old webhook and pending updates.")
 
 
-async def keepalive_userbot():
-    """Reconnect userbot if it drops."""
-    while True:
-        try:
-            if not userbot_client.is_connected():
-                logger.warning("Userbot disconnected — reconnecting...")
-                await userbot_client.connect()
-            await asyncio.sleep(30)
-        except Exception as e:
-            logger.error(f"Keepalive error: {e}")
-            await asyncio.sleep(10)
-
-
 async def run_all():
     await clear_old_sessions()
     await asyncio.sleep(2)
 
     upload_queue.start()
 
-    # Connect userbot
-    await userbot_client.connect()
+    # Use start() not connect() — this fully authenticates the session
+    await userbot_client.start()
+
     if not await userbot_client.is_user_authorized():
-        logger.error("Userbot session expired! Re-generate TELEGRAM_SESSION on Colab.")
+        logger.error("Session expired! Re-generate TELEGRAM_SESSION on Google Colab.")
         return
 
-    logger.info("Userbot connected and authorized.")
+    me = await userbot_client.get_me()
+    logger.info(f"Userbot logged in as: {me.first_name} (@{me.username})")
 
     # Start bot
     bot_app = get_bot_app()
@@ -54,11 +43,7 @@ async def run_all():
 
     logger.info("All services running.")
 
-    # Run both keepalive and userbot together
-    await asyncio.gather(
-        userbot_client.run_until_disconnected(),
-        keepalive_userbot(),
-    )
+    await userbot_client.run_until_disconnected()
 
     await bot_app.updater.stop()
     await bot_app.stop()
